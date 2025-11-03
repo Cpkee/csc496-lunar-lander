@@ -65,3 +65,33 @@ In a more thorough study one might want to increase the number of trained agents
 <a id="ref_2">[2] **Playing Atari with Deep Reinforcement Learning**. Volodymyr Mnih, Koray Kavukcuoglu, David Silver, Alex Graves, Ioannis Antonoglou, Daan Wierstra, Martin Riedmiller. [arXiv:1312.5602](https://arxiv.org/abs/1312.5602).</a>
 
 <a id="ref_3">[3] **Deep Reinforcement Learning with Double Q-learning**. Hado van Hasselt, Arthur Guez, David Silver. [arXiv:1509.06461](https://arxiv.org/abs/1509.06461).</a>
+
+##STEPS
+The Complete Workflow:
+
+  # Step 1: Train both algorithms
+  python train_agent.py --f my_agent --verbose             # Actor-Critic
+  python train_agent.py --f my_dqn_agent --dqn --verbose   # DQN
+
+  # Step 2: Test both trained agents  
+  python run_agent.py --f my_agent --verbose               # Test Actor-Critic
+  python run_agent.py --f my_dqn_agent --dqn --verbose     # Test DQN
+
+  # Step 3: Analyze results
+  jupyter notebook trained_agents/plot_results.ipynb
+
+  Why This Order Matters:
+
+  1. Training first gives you the "brain" of your agent
+  2. Testing second evaluates how well that brain performs on unseen data
+  3. Analysis third helps you understand which algorithm learned better and why
+
+  Think of it like: Study → Take Exam → Review Your Grades!
+
+  Pro Tip: Always run with --verbose to watch your agent learn in real-time. It's fascinating to see the rewards
+  gradually improve from crashes (-100+) to successful landings (+200)!
+
+  ##How to run Jupyter from within your virtual environment:
+  source venv/bin/activate
+  pip install jupyter
+  jupyter notebook
