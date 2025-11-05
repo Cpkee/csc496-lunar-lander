@@ -72,7 +72,7 @@ if not overwrite:
         raise RuntimeError(error_msg.format(output_filename_training_data))
 
 # Create environment
-env = gym.make('LunarLander-v2')
+env = gym.make('LunarLander-v3')
 
 # Obtain dimensions of action and observation space
 N_actions = env.action_space.n

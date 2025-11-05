@@ -16,7 +16,7 @@ import agent_class as agent
 
 
 #############################################################################
-# This code runs the gym environment "LunarLander-v2" using a trained agent #
+# This code runs the gym environment "LunarLander-v3" using a trained agent #
 #############################################################################
 
 # Example for run from command line:
@@ -24,7 +24,7 @@ import agent_class as agent
 #   python run_agent.py --f my_file --verbose --overwrite --N 500
 #
 # This command loads the agent state stored in my_file.tar, uses this agent
-# to run N = 500 episodes of the LunarLander-v2 environment, and stores the
+# to run N = 500 episodes of the LunarLander-v3 environment, and stores the
 # resulting list of returns per episode and duration per episode in the file
 # my_file_trajs.h5
 # 
@@ -77,7 +77,7 @@ def run_and_save_simulations(env, # environment
                             dqn=False):
     #
     # load trained model
-    input_dictionary = torch.load(open(input_filename,'rb'))
+    input_dictionary = torch.load(open(input_filename,'rb'), weights_only=False)
     dict_keys = np.array(list(input_dictionary.keys())).astype(int)
     max_index = np.max(dict_keys)
     input_dictionary = input_dictionary[max_index] # During training we 
@@ -96,7 +96,7 @@ def run_and_save_simulations(env, # environment
     my_agent.load_state(state=input_dictionary)
     #
     # instantiate environment
-    env = gym.make('LunarLander-v2')
+    env = gym.make('LunarLander-v3')
     #
     durations = []
     returns = []
@@ -144,7 +144,7 @@ def run_and_save_simulations(env, # environment
     
 
 # Create environment
-env = gym.make('LunarLander-v2')
+env = gym.make('LunarLander-v3')
 
 run_and_save_simulations(env=env,
                             input_filename=input_filename,
