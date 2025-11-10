@@ -48,8 +48,11 @@ parser.add_argument('--dqn', action='store_true') # use this flag to train
                                                 # via deep Q-learning
 parser.add_argument('--ddqn', action='store_true') # use this flag to train 
                                                 # via double deep Q-learning
+parser.add_argument('--ppo', action='store_true') # use this flag to train
+                                                # via Proximal Policy Optimization (PPO)
 parser.set_defaults(dqn=False)
 parser.set_defaults(ddqn=False)
+parser.set_defaults(ppo=False)
 args = parser.parse_args()
 
 # Create output filenames
@@ -60,6 +63,7 @@ verbose=args.verbose
 overwrite=args.overwrite
 dqn=args.dqn
 ddqn=args.ddqn
+ppo=args.ppo
 
 if not overwrite:
     # Comment the following out if you want to overwrite
@@ -123,7 +127,9 @@ parameters = {
         }
 
 # Instantiate agent class
-if dqn or ddqn:
+if ppo:
+    my_agent = agent.ppo(parameters=parameters)
+elif dqn or ddqn:
     if ddqn:
         parameters['doubledqn'] = True
     #
