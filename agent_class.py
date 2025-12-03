@@ -32,6 +32,55 @@ class memory(object):
     def __len__(self):
         return len(self.memory)
 
+# NEW CODE FOR PER
+class PrioritizedMemory:
+    
+    def __init__(self, capacity, alpha=0.6):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.memory = []
+        self.priorities = []
+        self.position = 0
+        self.Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'done'))
+
+    def push(self, *args):
+        max_priority = max(self.priorities, default=1.0)
+        transition = self.Transition(*args)
+        if len(self.memory) < self.capacity:
+            self.memory.append(transition)
+            self.priorities.append(max_priority)
+        else:
+            self.memory[self.position] = transition
+            self.priorities[self.position] = max_priority
+            self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size, beta=0.4):
+        if len(self.memory) == 0:
+            return []
+
+        priorities = np.array(self.priorities, dtype=np.float32)
+        probs = priorities ** self.alpha
+        probs /= probs.sum()
+
+        indices = np.random.choice(len(self.memory), batch_size, p=probs)
+        samples = [self.memory[idx] for idx in indices]
+
+        # Importance-sampling weights
+        total = len(self.memory)
+        weights = (total * probs[indices]) ** (-beta)
+        weights /= weights.max()
+
+        batch = self.Transition(*zip(*samples))
+        return batch, indices, weights
+
+    def update_priorities(self, indices, priorities):
+        for idx, priority in zip(indices, priorities):
+            self.priorities[idx] = priority
+    
+    def __len__(self):
+        return len(self.memory)
+
+
 class neural_network(nn.Module):
     '''
     Feedforward neural network with variable number
@@ -222,7 +271,7 @@ class agent_base():
         #################################
         try: # 
             self.n_memory = int(parameters['n_memory'])
-            self.memory = memory(self.n_memory)
+            self.memory = PrioritizedMemory(self.n_memory)
         except KeyError:
             pass
         #
@@ -715,7 +764,7 @@ class dqn(agent_base):
         default_parameters['d_epsilon'] = 0.00005 # decrease of epsilon
             # after each training epoch
         #
-        default_parameters['doubledqn'] = False
+        default_parameters['doubledqn'] = True    # activate doubledqn
         #
         return default_parameters
 
@@ -834,9 +883,13 @@ class dqn(agent_base):
         if len(self.memory) < self.batch_size:
             return
         #
-        state_batch, action_batch, next_state_batch, \
-                        reward_batch, done_batch = self.get_samples_from_memory()
-        #
+        batch, indices, weights = self.memory.sample(self.batch_size)
+        state_batch = torch.cat([torch.tensor(s).unsqueeze(0) for s in batch.state], dim=0)
+        next_state_batch = torch.cat([torch.tensor(ns).unsqueeze(0) for ns in batch.next_state], dim=0)
+        action_batch = torch.cat([torch.tensor(a) for a in batch.action]).to(device)
+        reward_batch = torch.cat([torch.tensor(r, dtype=torch.float32) for r in batch.reward]).to(device)
+        done_batch = torch.tensor(batch.done, dtype=torch.float32).to(device)
+        weights = torch.tensor(weights, dtype=torch.float32).to(device)
         policy_net = self.neural_networks['policy_net']
         target_net = self.neural_networks['target_net']
         #
@@ -881,10 +934,14 @@ class dqn(agent_base):
         RHS = RHS.unsqueeze(1) # RHS.shape = [batch_size, 1]
         #
         # optimize the model
-        loss_ = loss(LHS, RHS)
+        td_errors = (LHS - RHS).squeeze(1)           # shape: [batch_size]
+        loss_ = (td_errors.pow(2) * weights).mean()  # # importance-sampling weighted loss
         optimizer.zero_grad()
         loss_.backward()
         optimizer.step()
+        #
+        new_priorities = td_errors.abs().detach().cpu().numpy() + 1e-6
+        self.memory.update_priorities(indices, new_priorities)
         #
         policy_net.eval() # turn off training mode
         #
@@ -1067,5 +1124,3 @@ class actor_critic(agent_base):
         #
         actor_net.eval()
         #
-
-
