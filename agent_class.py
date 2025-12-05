@@ -81,6 +81,194 @@ class PrioritizedMemory:
         return len(self.memory)
 
 
+class PPOMemory(object):
+    """
+    Memory class for PPO algorithm that stores trajectories and computes
+    Generalized Advantage Estimation (GAE).
+    
+    Unlike the standard replay buffer, this memory:
+    - Stores complete trajectories with log probabilities and values
+    - Computes advantages using GAE
+    - Supports multiple epochs of minibatch training
+    - Clears after each policy update
+    """
+    
+    def __init__(self, gamma=0.99, gae_lambda=0.95):
+        """
+        Initialize PPO memory
+        
+        Args:
+            gamma: Discount factor for rewards
+            gae_lambda: Lambda parameter for GAE (λ in the paper)
+        """
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.log_probs = []
+        self.values = []
+        self.dones = []
+        
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        
+        # These will be computed by compute_gae()
+        self.advantages = None
+        self.returns = None
+    
+    def push(self, state, action, reward, log_prob, value, done):
+        """
+        Add a transition to the trajectory
+        
+        Args:
+            state: Current state (numpy array or tensor)
+            action: Action taken (int or tensor)
+            reward: Reward received (float or tensor)
+            log_prob: Log probability of the action under current policy (tensor)
+            value: Value estimate V(s) from critic (tensor)
+            done: Whether episode terminated (bool)
+        """
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.log_probs.append(log_prob)
+        self.values.append(value)
+        self.dones.append(done)
+    
+    def compute_gae(self, last_value=0.0):
+        """
+        Compute Generalized Advantage Estimation (GAE) and returns.
+        
+        GAE formula (Schulman et al. 2016):
+        δ_t = r_t + γ*V(s_{t+1})*(1-done_t) - V(s_t)
+        A_t = δ_t + (γλ)δ_{t+1} + (γλ)²δ_{t+2} + ...
+        
+        Returns are computed as: R_t = A_t + V(s_t)
+        
+        Args:
+            last_value: Value estimate for the last state (used if trajectory
+                       was truncated but not terminated). Default 0.0.
+        """
+        # Convert lists to tensors for efficient computation
+        rewards = torch.tensor(self.rewards, dtype=torch.float32)
+        values = torch.cat(self.values)  # Already tensors from critic network
+        dones = torch.tensor(self.dones, dtype=torch.float32)
+        
+        # Initialize advantages list
+        advantages = []
+        gae = 0.0
+        
+        # Compute GAE backwards from end of trajectory
+        # We iterate backwards because each advantage depends on future advantages
+        for t in reversed(range(len(rewards))):
+            if t == len(rewards) - 1:
+                # Last step: use last_value as next value
+                next_value = last_value
+            else:
+                next_value = values[t + 1]
+            
+            # TD residual: δ_t = r_t + γ*V(s_{t+1})*(1-done_t) - V(s_t)
+            delta = rewards[t] + self.gamma * next_value * (1.0 - dones[t]) - values[t]
+            
+            # GAE: A_t = δ_t + (γλ)δ_{t+1} + (γλ)²δ_{t+2} + ...
+            # We compute this recursively: gae = δ_t + (γλ)*gae
+            gae = delta + self.gamma * self.gae_lambda * (1.0 - dones[t]) * gae
+            advantages.insert(0, gae)
+        
+        # Convert to tensor
+        self.advantages = torch.tensor(advantages, dtype=torch.float32)
+        
+        # Normalize advantages (improves training stability)
+        # Only normalize if we have more than 1 sample and std > 0
+        if len(self.advantages) > 1:
+            adv_mean = self.advantages.mean()
+            adv_std = self.advantages.std()
+            if adv_std > 1e-8:
+                self.advantages = (self.advantages - adv_mean) / adv_std
+            # If std is too small, just center the advantages
+            elif len(self.advantages) > 1:
+                self.advantages = self.advantages - adv_mean
+        
+        # Compute returns: R_t = A_t + V(s_t)
+        # These are the target values for training the critic
+        self.returns = self.advantages + values
+    
+    def get_minibatches(self, minibatch_size):
+        """
+        Generate random minibatches for training.
+        
+        This method yields minibatches by randomly shuffling the trajectory data
+        and splitting it into batches. This is used for multiple epochs of SGD.
+        
+        Args:
+            minibatch_size: Size of each minibatch
+            
+        Yields:
+            Dictionary containing minibatch of:
+                - states: Batch of states
+                - actions: Batch of actions
+                - old_log_probs: Batch of log probabilities under old policy
+                - returns: Batch of computed returns (targets for critic)
+                - advantages: Batch of computed advantages (for policy update)
+        """
+        if self.advantages is None or self.returns is None:
+            raise RuntimeError("Must call compute_gae() before get_minibatches()")
+        
+        # Get total number of samples
+        n_samples = len(self.states)
+        
+        # Convert states list to tensor
+        # Handle both numpy arrays and tensors
+        if isinstance(self.states[0], torch.Tensor):
+            states_tensor = torch.stack(self.states)
+        else:
+            states_tensor = torch.tensor(np.array(self.states), dtype=torch.float32)
+        
+        # Convert actions to tensor
+        if isinstance(self.actions[0], torch.Tensor):
+            actions_tensor = torch.cat(self.actions)
+        else:
+            actions_tensor = torch.tensor(self.actions, dtype=torch.long)
+        
+        # Log probs are already tensors
+        log_probs_tensor = torch.cat(self.log_probs)
+        
+        # Create random permutation for shuffling
+        indices = torch.randperm(n_samples)
+        
+        # Generate minibatches
+        for start_idx in range(0, n_samples, minibatch_size):
+            end_idx = min(start_idx + minibatch_size, n_samples)
+            batch_indices = indices[start_idx:end_idx]
+            
+            yield {
+                'states': states_tensor[batch_indices],
+                'actions': actions_tensor[batch_indices],
+                'old_log_probs': log_probs_tensor[batch_indices],
+                'returns': self.returns[batch_indices],
+                'advantages': self.advantages[batch_indices],
+            }
+    
+    def clear(self):
+        """
+        Clear all stored trajectory data.
+        
+        This should be called after each policy update in PPO, as we don't
+        maintain a long-term replay buffer like in DQN.
+        """
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.log_probs = []
+        self.values = []
+        self.dones = []
+        self.advantages = None
+        self.returns = None
+    
+    def __len__(self):
+        """Return the number of transitions currently stored"""
+        return len(self.states)
+
+
 class neural_network(nn.Module):
     '''
     Feedforward neural network with variable number
@@ -1124,3 +1312,642 @@ class actor_critic(agent_base):
         #
         actor_net.eval()
         #
+
+
+class ppo(agent_base):
+    """
+    Proximal Policy Optimization (PPO) agent implementation.
+    
+    Based on "Proximal Policy Optimization Algorithms" by Schulman et al. (2017).
+    https://arxiv.org/abs/1707.06347
+    
+    PPO is a policy gradient method that uses:
+    1. Clipped surrogate objective to prevent too large policy updates
+    2. Generalized Advantage Estimation (GAE) for better advantage estimates
+    3. Multiple epochs of minibatch SGD on collected trajectories
+    4. Combined loss: policy loss + value loss - entropy bonus
+    
+    Key differences from Actor-Critic:
+    - Uses clipped probability ratio instead of raw log probability
+    - Collects trajectories and performs multiple update epochs
+    - Uses GAE instead of TD error for advantages
+    - Includes entropy bonus for exploration
+    """
+    
+    def __init__(self, parameters):
+        """
+        Initialize PPO agent
+        
+        Args:
+            parameters: Dictionary with agent parameters including:
+                - n_state: Dimensionality of state space
+                - n_actions: Number of discrete actions
+                - (optional) PPO-specific hyperparameters
+        """
+        # Call parent initialization first
+        # This will call set_parameters() which initializes ppo_memory
+        super().__init__(parameters=parameters)
+        
+        # Initialize PPO-specific components
+        self.Softmax = nn.Softmax(dim=1)  # For converting logits to probabilities
+        self.LogSoftmax = nn.LogSoftmax(dim=1)  # For computing log probabilities
+        
+        # Note: ppo_memory is initialized in set_parameters()
+    
+    def get_default_parameters(self):
+        """
+        Get default parameters for PPO agent
+        
+        Returns PPO-specific hyperparameters based on Schulman et al. 2017
+        for discrete action spaces (Table 3 in the paper).
+        """
+        # Get base parameters
+        default_parameters = super().get_default_parameters()
+        
+        # Update network architecture for PPO
+        # Actor network (policy_net): outputs action logits
+        default_parameters['neural_networks']['policy_net']['layers'] = \
+            [self.n_state, 128, 64, self.n_actions]
+        
+        # Critic network: outputs state value V(s)
+        default_parameters['neural_networks']['critic_net'] = {}
+        default_parameters['neural_networks']['critic_net']['layers'] = \
+            [self.n_state, 128, 64, 1]  # Scalar output for value
+        
+        # Optimizer for critic network
+        default_parameters['optimizers']['critic_net'] = {
+            'optimizer': 'Adam',
+            'optimizer_args': {'lr': 2.5e-4},  # Learning rate from paper
+        }
+        
+        # Update policy network optimizer to Adam (PPO typically uses Adam)
+        default_parameters['optimizers']['policy_net']['optimizer'] = 'Adam'
+        default_parameters['optimizers']['policy_net']['optimizer_args'] = {'lr': 2.5e-4}
+        
+        # PPO-specific hyperparameters (from paper, Table 3 for discrete)
+        default_parameters['horizon'] = 128  # T in paper: steps per trajectory
+        default_parameters['n_epochs'] = 4  # K in paper: optimization epochs
+        default_parameters['minibatch_size'] = 32  # Size of minibatches
+        default_parameters['clip_epsilon'] = 0.1  # ε in paper: clipping parameter
+        default_parameters['gae_lambda'] = 0.95  # λ in paper: GAE parameter
+        default_parameters['value_loss_coef'] = 0.5  # c1 in paper
+        default_parameters['entropy_coef'] = 0.01  # c2 in paper
+        default_parameters['max_grad_norm'] = 0.5  # Gradient clipping
+        
+        # Override batch_size to match minibatch_size for consistency
+        default_parameters['batch_size'] = 32
+        
+        # Training stride doesn't apply to PPO (we update after collecting horizon)
+        # But keep it for compatibility with base class
+        default_parameters['training_stride'] = 128
+        
+        return default_parameters
+    
+    def set_parameters(self, parameters):
+        """
+        Set PPO-specific parameters
+        
+        Args:
+            parameters: Dictionary with agent parameters
+        """
+        super().set_parameters(parameters=parameters)
+        
+        # Set default values first in case they're not in parameters
+        self.horizon = 128
+        self.n_epochs = 4
+        self.minibatch_size = 32
+        self.clip_epsilon = 0.1
+        self.gae_lambda = 0.95
+        self.value_loss_coef = 0.5
+        self.entropy_coef = 0.01
+        self.max_grad_norm = 0.5
+        
+        # PPO-specific parameters (override defaults if provided)
+        try:
+            self.horizon = parameters['horizon']
+        except KeyError:
+            pass
+        
+        try:
+            self.n_epochs = parameters['n_epochs']
+        except KeyError:
+            pass
+        
+        try:
+            self.minibatch_size = parameters['minibatch_size']
+        except KeyError:
+            pass
+        
+        try:
+            self.clip_epsilon = parameters['clip_epsilon']
+        except KeyError:
+            pass
+        
+        try:
+            self.gae_lambda = parameters['gae_lambda']
+        except KeyError:
+            pass
+        
+        try:
+            self.value_loss_coef = parameters['value_loss_coef']
+        except KeyError:
+            pass
+        
+        try:
+            self.entropy_coef = parameters['entropy_coef']
+        except KeyError:
+            pass
+        
+        try:
+            self.max_grad_norm = parameters['max_grad_norm']
+        except KeyError:
+            pass
+        
+        # Initialize PPO memory with discount factor and GAE lambda
+        # This needs to happen after all parameters are set
+        self.ppo_memory = PPOMemory(
+            gamma=self.discount_factor,
+            gae_lambda=self.gae_lambda
+        )
+    
+    def initialize_optimizers(self, optimizers):
+        """
+        Initialize optimizers for both actor and critic networks
+        
+        Args:
+            optimizers: Dictionary specifying optimizer configurations
+        """
+        self.optimizers = {}
+        for key, value in optimizers.items():
+            optimizer_name = value['optimizer']
+            optimizer_args = value['optimizer_args']
+            
+            # Use Adam optimizer (standard for PPO)
+            if optimizer_name == 'Adam':
+                self.optimizers[key] = torch.optim.Adam(
+                    self.neural_networks[key].parameters(),
+                    **optimizer_args
+                )
+            else:
+                # Fallback to RMSprop if specified
+                self.optimizers[key] = torch.optim.RMSprop(
+                    self.neural_networks[key].parameters(),
+                    **optimizer_args
+                )
+    
+    def initialize_losses(self, losses):
+        """
+        Initialize loss functions for PPO
+        
+        Note: The actual PPO loss will be computed in run_optimization_step()
+        as it requires special handling of clipped objectives. This method
+        is kept for compatibility with the base class.
+        
+        Args:
+            losses: Dictionary specifying loss configurations (not used directly)
+        """
+        # Value function uses MSE loss
+        self.value_loss_fn = nn.MSELoss()
+        
+        # Policy loss will be computed using clipped surrogate objective
+        # Entropy loss will be computed from action distribution
+        # These are implemented in compute_ppo_loss() method
+    
+    def act(self, state, deterministic=False):
+        """
+        Select an action using the current policy
+        
+        For PPO, we use a stochastic policy during training and can optionally
+        use a deterministic policy (argmax) during evaluation.
+        
+        Args:
+            state: Current state (numpy array or tensor)
+            deterministic: If True, select action with highest probability
+                          If False, sample from probability distribution
+        
+        Returns:
+            action (int): Selected action
+            log_prob (tensor): Log probability of selected action (only during training)
+            value (tensor): Value estimate V(s) from critic (only during training)
+        """
+        actor_net = self.neural_networks['policy_net']
+        critic_net = self.neural_networks['critic_net']
+        
+        # Convert state to tensor if needed
+        if not isinstance(state, torch.Tensor):
+            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+        else:
+            state_tensor = state.unsqueeze(0) if state.dim() == 1 else state
+        
+        with torch.no_grad():
+            actor_net.eval()
+            critic_net.eval()
+            
+            # Get action logits from actor
+            logits = actor_net(state_tensor)
+            
+            # Convert to probabilities
+            probs = self.Softmax(logits)
+            
+            # Create categorical distribution
+            dist = Categorical(probs)
+            
+            # Select action
+            if deterministic and not self.in_training:
+                # Deterministic: take action with highest probability
+                action = torch.argmax(probs, dim=1)
+            else:
+                # Stochastic: sample from distribution
+                action = dist.sample()
+            
+            # If in training mode, also compute log_prob and value
+            if self.in_training:
+                log_prob = dist.log_prob(action)
+                value = critic_net(state_tensor).squeeze(-1)
+                
+                actor_net.train()
+                critic_net.train()
+                
+                return action.item(), log_prob, value
+            else:
+                return action.item()
+    
+    def add_memory(self, state, action, reward, log_prob, value, done):
+        """
+        Add transition to PPO memory
+        
+        Args:
+            state: Current state
+            action: Action taken
+            reward: Reward received
+            log_prob: Log probability of action under current policy
+            value: Value estimate V(s) from critic
+            done: Whether episode terminated
+        """
+        self.ppo_memory.push(state, action, reward, log_prob, value, done)
+    
+    def compute_policy_loss(self, states, actions, old_log_probs, advantages):
+        """
+        Compute the PPO clipped surrogate objective (policy loss).
+        
+        This implements Equation 7 from Schulman et al. (2017):
+        L^CLIP(θ) = Ê_t[min(r_t(θ)Â_t, clip(r_t(θ), 1-ε, 1+ε)Â_t)]
+        
+        Where:
+        - r_t(θ) = π_θ(a_t|s_t) / π_θ_old(a_t|s_t) is the probability ratio
+        - Â_t is the advantage estimate
+        - ε is the clipping parameter (self.clip_epsilon)
+        
+        The clipping prevents the policy from changing too much in a single update,
+        which is the key innovation of PPO.
+        
+        Args:
+            states: Batch of states [batch_size, state_dim]
+            actions: Batch of actions taken [batch_size]
+            old_log_probs: Log probabilities under old policy [batch_size]
+            advantages: Advantage estimates [batch_size]
+        
+        Returns:
+            policy_loss: Negative of the clipped objective (to minimize)
+            ratio: Probability ratios (for logging/debugging)
+            entropy: Entropy of action distribution (for exploration bonus)
+        """
+        # Get current policy logits
+        actor_net = self.neural_networks['policy_net']
+        logits = actor_net(states)
+        
+        # Convert to probabilities and create distribution
+        probs = self.Softmax(logits)
+        dist = Categorical(probs)
+        
+        # Compute new log probabilities for the actions that were taken
+        new_log_probs = dist.log_prob(actions)
+        
+        # Compute probability ratio: r_t(θ) = π_θ(a|s) / π_θ_old(a|s)
+        # In log space: r_t(θ) = exp(log π_θ(a|s) - log π_θ_old(a|s))
+        ratio = torch.exp(new_log_probs - old_log_probs)
+        
+        # Compute the two terms of the clipped objective
+        # Term 1: r_t(θ) * Â_t (unclipped)
+        surr1 = ratio * advantages
+        
+        # Term 2: clip(r_t(θ), 1-ε, 1+ε) * Â_t (clipped)
+        ratio_clipped = torch.clamp(ratio, 
+                                     1.0 - self.clip_epsilon, 
+                                     1.0 + self.clip_epsilon)
+        surr2 = ratio_clipped * advantages
+        
+        # PPO objective: take minimum of clipped and unclipped
+        # We want to maximize this, so we minimize the negative
+        policy_loss = -torch.min(surr1, surr2).mean()
+        
+        # Compute entropy for exploration bonus
+        # Entropy = -Σ p(a) * log(p(a))
+        entropy = dist.entropy().mean()
+        
+        return policy_loss, ratio, entropy
+    
+    def compute_value_loss(self, states, returns):
+        """
+        Compute the value function loss.
+        
+        This is a simple Mean Squared Error between the critic's predictions
+        and the computed returns from GAE.
+        
+        Args:
+            states: Batch of states [batch_size, state_dim]
+            returns: Target returns computed from GAE [batch_size]
+        
+        Returns:
+            value_loss: MSE loss for the value function
+        """
+        # Get value predictions from critic
+        critic_net = self.neural_networks['critic_net']
+        values_pred = critic_net(states).squeeze(-1)
+        
+        # Compute MSE loss
+        value_loss = self.value_loss_fn(values_pred, returns)
+        
+        return value_loss
+    
+    def compute_ppo_loss(self, states, actions, old_log_probs, returns, advantages):
+        """
+        Compute the complete PPO loss function.
+        
+        This combines three components:
+        L = L^CLIP(θ) - c1 * L^VF(θ) + c2 * S[π_θ](s_t)
+        
+        Where:
+        - L^CLIP: Clipped surrogate objective (policy loss)
+        - L^VF: Value function loss (MSE)
+        - S: Entropy bonus for exploration
+        - c1: Value loss coefficient (self.value_loss_coef)
+        - c2: Entropy coefficient (self.entropy_coef)
+        
+        Args:
+            states: Batch of states [batch_size, state_dim]
+            actions: Batch of actions [batch_size]
+            old_log_probs: Old log probabilities [batch_size]
+            returns: Target returns from GAE [batch_size]
+            advantages: Advantage estimates [batch_size]
+        
+        Returns:
+            total_loss: Combined loss for backpropagation
+            loss_dict: Dictionary with individual loss components for logging
+        """
+        # Compute policy loss (clipped surrogate objective)
+        policy_loss, ratio, entropy = self.compute_policy_loss(
+            states, actions, old_log_probs, advantages
+        )
+        
+        # Compute value loss
+        value_loss = self.compute_value_loss(states, returns)
+        
+        # Combine losses with coefficients
+        # Note: policy_loss is already negative (we want to maximize objective)
+        # value_loss is positive (we want to minimize MSE)
+        # entropy is positive (we want to maximize, so subtract)
+        total_loss = policy_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy
+        
+        # Create dictionary for logging
+        loss_dict = {
+            'total_loss': total_loss.item(),
+            'policy_loss': policy_loss.item(),
+            'value_loss': value_loss.item(),
+            'entropy': entropy.item(),
+            'ratio_mean': ratio.mean().item(),
+            'ratio_std': ratio.std().item() if len(ratio) > 1 else 0.0,
+        }
+        
+        return total_loss, loss_dict
+    
+    def run_optimization_step(self):
+        """
+        Run PPO optimization step on collected trajectory.
+        
+        This method:
+        1. Computes GAE on the collected trajectory
+        2. Performs multiple epochs of minibatch SGD
+        3. Updates both policy and value networks
+        4. Applies gradient clipping
+        5. Clears memory after updates
+        
+        This is called after collecting a full trajectory (horizon steps).
+        """
+        # Check if we have enough data
+        if len(self.ppo_memory) == 0:
+            return
+        
+        # Get the last value for GAE computation
+        # This is used for bootstrapping if trajectory was truncated
+        with torch.no_grad():
+            critic_net = self.neural_networks['critic_net']
+            critic_net.eval()
+            # Get the last state's value
+            if len(self.ppo_memory.states) > 0:
+                last_state = self.ppo_memory.states[-1]
+                if not isinstance(last_state, torch.Tensor):
+                    last_state = torch.tensor(last_state, dtype=torch.float32)
+                last_state = last_state.unsqueeze(0)
+                last_value = critic_net(last_state).squeeze(-1).item()
+                # If last transition was terminal, use 0
+                if self.ppo_memory.dones[-1]:
+                    last_value = 0.0
+            else:
+                last_value = 0.0
+            critic_net.train()
+        
+        # Compute GAE advantages and returns
+        self.ppo_memory.compute_gae(last_value=last_value)
+        
+        # Perform multiple epochs of optimization
+        for epoch in range(self.n_epochs):
+            # Get minibatches for this epoch
+            for batch in self.ppo_memory.get_minibatches(self.minibatch_size):
+                # Extract batch data
+                states = batch['states']
+                actions = batch['actions']
+                old_log_probs = batch['old_log_probs']
+                returns = batch['returns']
+                advantages = batch['advantages']
+                
+                # Set networks to training mode
+                self.neural_networks['policy_net'].train()
+                self.neural_networks['critic_net'].train()
+                
+                # Compute PPO loss
+                total_loss, loss_dict = self.compute_ppo_loss(
+                    states, actions, old_log_probs, returns, advantages
+                )
+                
+                # Zero gradients
+                self.optimizers['policy_net'].zero_grad()
+                self.optimizers['critic_net'].zero_grad()
+                
+                # Backpropagate
+                total_loss.backward()
+                
+                # Clip gradients to prevent exploding gradients
+                if self.max_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.neural_networks['policy_net'].parameters(),
+                        self.max_grad_norm
+                    )
+                    torch.nn.utils.clip_grad_norm_(
+                        self.neural_networks['critic_net'].parameters(),
+                        self.max_grad_norm
+                    )
+                
+                # Update networks
+                self.optimizers['policy_net'].step()
+                self.optimizers['critic_net'].step()
+        
+        # Clear memory after updates
+        self.ppo_memory.clear()
+    
+    def train(self, environment, verbose=True, model_filename=None, training_filename=None):
+        """
+        Train the PPO agent on a provided environment.
+        
+        This overrides the base class train() method to implement PPO-specific
+        trajectory collection and update pattern.
+        
+        PPO training loop:
+        1. Collect trajectory of horizon steps (or until episode ends)
+        2. Compute GAE on collected trajectory
+        3. Perform multiple epochs of minibatch SGD
+        4. Clear memory and repeat
+        
+        Args:
+            environment: Environment with reset() and step() methods
+            verbose: Print training progress (default: True)
+            model_filename: Path to save model checkpoints
+            training_filename: Path to save training statistics
+        
+        Returns:
+            training_results: Dictionary with training statistics
+        """
+        self.in_training = True
+        
+        training_complete = False
+        step_counter = 0  # Total environment steps
+        update_counter = 0  # Number of PPO updates performed
+        
+        # Training statistics
+        episode_durations = []
+        episode_returns = []
+        steps_simulated = []
+        training_updates = []
+        
+        output_state_dicts = {}
+        
+        if verbose:
+            training_progress_header = (
+                "| episode | return          | minimal return    "
+                    "  | mean return        |\n"
+                "|         | (this episode)  | (last {0} episodes)  "
+                    "| (last {0} episodes) |\n"
+                "|---------------------------------------------------"
+                    "--------------------")
+            print(training_progress_header.format(self.n_solving_episodes))
+            
+            status_progress_string = (
+                        "| {0: 7d} |   {1: 10.3f}    |     "
+                        "{2: 10.3f}      |    {3: 10.3f}      |")
+        
+        # Main training loop
+        for n_episode in range(self.n_episodes_max):
+            # Reset environment
+            state, info = environment.reset()
+            current_total_reward = 0.
+            episode_steps = 0
+            
+            # Run episode
+            while True:
+                # Select action (returns action, log_prob, value during training)
+                action, log_prob, value = self.act(state)
+                
+                # Take action in environment
+                next_state, reward, terminated, truncated, info = environment.step(action)
+                
+                step_counter += 1
+                episode_steps += 1
+                done = terminated or truncated
+                current_total_reward += reward
+                
+                # Store transition in PPO memory
+                self.add_memory(state, action, reward, log_prob, value, done)
+                
+                state = next_state
+                
+                # Update policy after collecting horizon steps
+                if len(self.ppo_memory) >= self.horizon or done:
+                    self.run_optimization_step()
+                    update_counter += 1
+                
+                if done:
+                    # Episode ended
+                    episode_durations.append(episode_steps)
+                    episode_returns.append(current_total_reward)
+                    steps_simulated.append(step_counter)
+                    training_updates.append(update_counter)
+                    
+                    # Check stopping criterion
+                    training_complete, min_ret, mean_ret = \
+                        self.evaluate_stopping_criterion(episode_returns)
+                    
+                    if verbose:
+                        if n_episode % 100 == 0 and n_episode > 0:
+                            end = '\n'
+                        else:
+                            end = '\r'
+                        if min_ret > self.solving_threshold_min:
+                            if mean_ret > self.solving_threshold_mean:
+                                end = '\n'
+                        
+                        print(status_progress_string.format(
+                            n_episode, current_total_reward, min_ret, mean_ret
+                        ), end=end)
+                    
+                    break
+            
+            # Save model and training stats periodically
+            if (n_episode % self.saving_stride == 0) \
+                    or training_complete \
+                    or n_episode == self.n_episodes_max - 1:
+                
+                if model_filename is not None:
+                    output_state_dicts[n_episode] = self.get_state()
+                    torch.save(output_state_dicts, model_filename)
+                
+                training_results = {
+                    'episode_durations': episode_durations,
+                    'epsiode_returns': episode_returns,
+                    'n_training_updates': training_updates,
+                    'n_steps_simulated': steps_simulated,
+                    'training_completed': False,
+                }
+                
+                if training_filename is not None:
+                    self.save_dictionary(
+                        dictionary=training_results,
+                        filename=training_filename
+                    )
+            
+            if training_complete:
+                training_results['training_completed'] = True
+                break
+            
+        if not training_complete:
+            warning_string = (
+                "Warning: Training was stopped because the "
+                "maximum number of episodes, {0}, was reached. "
+                "But the stopping criterion has not been met."
+            )
+            warnings.warn(warning_string.format(self.n_episodes_max))
+        
+        self.in_training = False
+        
+        return training_results
+
+
