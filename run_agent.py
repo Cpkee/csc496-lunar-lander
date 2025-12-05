@@ -45,12 +45,15 @@ parser.add_argument('--verbose', action='store_true')
 parser.set_defaults(verbose=False)
 parser.add_argument('--overwrite', action='store_true')
 parser.set_defaults(overwrite=False)
-parser.add_argument('--dqn', action='store_true') # use this flag to train 
-                                                # via deep Q-learning
-parser.add_argument('--ddqn', action='store_true') # use this flag to train 
-                                                # via double deep Q-learning
+parser.add_argument('--dqn', action='store_true') # use this flag to run
+                                                # DQN agent
+parser.add_argument('--ddqn', action='store_true') # use this flag to run
+                                                # double DQN agent
+parser.add_argument('--ppo', action='store_true') # use this flag to run
+                                                # PPO agent
 parser.set_defaults(dqn=False)
 parser.set_defaults(ddqn=False)
+parser.set_defaults(ppo=False)
 args = parser.parse_args()
 
 # Create input and output filenames
@@ -61,6 +64,7 @@ verbose=args.verbose
 overwrite=args.overwrite
 dqn=args.dqn
 ddqn=args.ddqn
+ppo=args.ppo
 if ddqn:
     dqn = True
 
@@ -74,10 +78,10 @@ if not overwrite:
 
 def run_and_save_simulations(env, # environment
                             input_filename,output_filename,N=1000,
-                            dqn=False):
+                            dqn=False,ppo=False):
     #
     # load trained model
-    input_dictionary = torch.load(open(input_filename,'rb'))
+    input_dictionary = torch.load(open(input_filename,'rb'), weights_only=False)
     dict_keys = np.array(list(input_dictionary.keys())).astype(int)
     max_index = np.max(dict_keys)
     input_dictionary = input_dictionary[max_index] # During training we 
@@ -89,7 +93,9 @@ def run_and_save_simulations(env, # environment
     # instantiate agent
     parameters = input_dictionary['parameters']
     # Instantiate agent class
-    if dqn:
+    if ppo:
+        my_agent = agent.ppo(parameters=parameters)
+    elif dqn:
         my_agent = agent.dqn(parameters=parameters)
     else:
         my_agent = agent.actor_critic(parameters=parameters)
@@ -150,4 +156,5 @@ run_and_save_simulations(env=env,
                             input_filename=input_filename,
                             output_filename=output_filename,
                             N=N,
-                            dqn=dqn)
+                            dqn=dqn,
+                            ppo=ppo)

@@ -95,3 +95,7 @@ The Complete Workflow:
   source venv/bin/activate
   pip install jupyter
   jupyter notebook
+
+  ###How to run the PPO Algorithm
+  cd /Users/cheepheng/Documents/GitHub/csc496-lunar-lander
+  python train_agent.py --f my_ppo_agent --ppo --verbose
